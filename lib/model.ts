@@ -1,4 +1,5 @@
-// Token Radar v1 — model: a shrunk-median comparables radar for farmable pre-token protocols.
+// Token Radar v2 — model: a fitted size curve with shrunk category offsets, validated
+// out of sample, for farmable pre-token protocols.
 //
 // The board ranks only protocols a reader can actually farm for a future token launch:
 // pre-token on the record, and not a CEX, a bridge, a wrapped or staked product of a token that
@@ -7,24 +8,35 @@
 // the dashboard's Excluded tab with the reason each one was left out, instead of being ranked.
 //
 // Implied value is calibrated from the snapshot's own tokenized peers, never from a hand-written
-// list of names. The market's log-log regression of market cap on TVL is weak (R-squared about
-// 0.19 on this snapshot, slope unstable across categories), so this model does NOT fit a power
-// law. It takes the median market-cap/TVL multiple of the tokenized peers in the protocol's own
-// category, shrunk toward the global median (k = 3 pseudo-peers), and clamps the result:
+// list of names. v1 used a shrunk category median; v2 replaces it, because leave-one-out
+// validation on the 128 tokenized peers shows the median is the weakest of the candidates
+// (median error x5.16, only 20.3% of peers predicted within 2x), while a fitted size curve
+// predicts held-out peers far better (median error x3.40, 32.0% within 2x). The shipped model
+// is the curve plus a shrunk category offset:
 //
-//   multiple(cat) = (n * median(cat) + 3 * globalMedian) / (n + 3)     (n = 0: globalMedian)
-//   multiple      = clamp(multiple, 0.03, 1.5)
+//   log(mcap) = a + b * log(TVL) + offset(category)
+//   offset(category) = clamp((n * mean_residual(category)) / (n + 10), -1, +1)
 //
 //   growth      = clamp(change_7d ?? 0, -40, +60)
 //   growthMult  = 1 + growth / 100 * 0.6
 //   age         = days from listed_at to as_of (unknown: 365)
 //   maturity    = 0.7 + 0.3 * min(age, 1095) / 1095
 //   chainMult   = 1 + 0.02 * min(chains.length, 15)
-//   implied     = min(5 * TVL, max(1, round(TVL * multiple * growthMult * maturity * chainMult)))
+//   implied     = min(5 * TVL, max(1, round(exp(a + b * log(TVL) + offset) * growthMult * maturity * chainMult)))
 //
-// Every constant above is fixed here and stated in the dashboard; every number that depends on
-// the data (the medians, the R-squared, the peer counts) is computed at run time from the
-// snapshot. The same function scores every row: no protocol name is ever special-cased.
+// The offset is a mean residual shrunk toward zero with 10 pseudo-peers, so a category with one
+// peer (Risk Curators: Api3 alone) moves the curve by +0.17 in log space instead of setting a
+// 0.904 multiple for the whole top of the board, as v1 did. Every constant above is fixed here
+// and stated in the dashboard; every number that depends on the data (the curve, the offsets,
+// the leave-one-out errors) is computed at run time from the snapshot. The same function scores
+// every row: no protocol name is ever special-cased.
+//
+// Farm economics: each row is also netted in dollars. The farm's cost is gas for 8 actions on
+// the protocol's first chain (a stated per-action table) plus the opportunity cost of the
+// capital held for the qualifying window at 5% a year. The expected share is the farmer's
+// slice of the implied value at the stated assumption that 10% of a token's implied value
+// reaches farmers. The net is share minus cost; it is a triage heuristic, not a promised
+// payout, and it scales with position size while gas stays flat, so the dashboard says so.
 
 /** One protocol entry of the sealed snapshot: exactly its ten fields. */
 export interface SnapshotProtocol {
@@ -61,9 +73,12 @@ export interface ModelConstants {
   chain_step: number;
   chain_max: number;
   shrink_k: number;
-  multiple_floor: number;
-  multiple_cap: number;
+  offset_cap: number;
   implied_cap_tvl: number;
+  farmer_allocation: number;
+  gas_actions: number;
+  opportunity_apy: number;
+  gas_usd: Record<string, number>;
 }
 
 export const MODEL: ModelConstants = {
@@ -76,14 +91,31 @@ export const MODEL: ModelConstants = {
   unknown_age_days: 365,
   chain_step: 0.02,
   chain_max: 15,
-  shrink_k: 3,
-  multiple_floor: 0.03,
-  multiple_cap: 1.5,
+  shrink_k: 10,
+  offset_cap: 1,
   implied_cap_tvl: 5,
+  farmer_allocation: 0.1,
+  gas_actions: 8,
+  opportunity_apy: 0.05,
+  gas_usd: {
+    ethereum: 6,
+    bsc: 0.5,
+    arbitrum: 0.1,
+    base: 0.1,
+    optimism: 0.1,
+    polygon: 0.05,
+    solana: 0.02,
+    avalanche: 0.3,
+    gnosis: 0.1,
+    linea: 0.1,
+    zksync: 0.1,
+    scroll: 0.1,
+    default: 0.5,
+  },
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-2-shrunk-median';
+export const MODEL_VERSION = 'radar-3-size-curve';
 
 /** How many live-token protocols the Live tab carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -112,7 +144,8 @@ export interface BoardRow {
   age_days: number | null;
   implied_value_usd: number;
   model: {
-    multiple: number;
+    curve_base: number;
+    category_offset: number;
     category_peers: number;
     growth_pct: number;
     growth_multiplier: number;
@@ -120,24 +153,50 @@ export interface BoardRow {
     chain_multiplier: number;
     age_days: number | null;
   };
+  economics: {
+    capital_usd: number;
+    hold_days: number;
+    gas_usd: number;
+    opportunity_usd: number;
+    cost_usd: number;
+    expected_share_usd: number;
+    net_usd: number;
+  };
   farm_steps: string[];
 }
 
-/** One calibration row: a category's peer median and its shrunk multiple. */
-export interface CalibrationRow {
+/** One fitted-curve offset: a category's mean residual, shrunk toward zero. */
+export interface OffsetRow {
   category: string;
   peers: number;
-  median: number | null;
-  multiple: number;
+  mean_residual: number;
+  offset: number;
+}
+
+/** One candidate model, scored by leave-one-out validation on the tokenized peers. */
+export interface LooRow {
+  model: string;
+  median_abs_log_err: number;
+  median_factor: number;
+  mean_abs_log_err: number;
+  within_2x: number;
+  within_3x: number;
+  chosen: boolean;
 }
 
 /** The calibration the model computed from the snapshot's tokenized peers. */
 export interface Calibration {
+  peer_count: number;
   global_median: number;
+  curve_intercept: number;
+  curve_slope: number;
   loglog_r2: number;
   loglog_slope: number;
-  peer_count: number;
-  per_category: CalibrationRow[];
+  offsets: OffsetRow[];
+  loo: LooRow[];
+  chosen_model: string;
+  chart_peers: [number, number][];
+  chart_line: [number, number][];
 }
 
 /** A tokenized peer shown as a comparable in a protocol's detail view. */
@@ -162,9 +221,12 @@ export interface RadarRow {
   implied_value_usd: number;
   multiple: number;
   category_peers: number;
+  curve_base: number;
+  category_offset: number;
   growth_multiplier: number;
   maturity_multiplier: number;
   chain_multiplier: number;
+  economics: BoardRow['economics'];
   peers: PeerRow[];
   farm_steps: string[];
 }
@@ -217,6 +279,8 @@ export class SnapshotError extends Error {
 }
 
 const DAY_MS = 86_400_000;
+const round2 = (n: number): number => Math.round(n * 100) / 100;
+const round3 = (n: number): number => Math.round(n * 1000) / 1000;
 const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
 
 /** A finite number, else `fallback`. */
@@ -238,6 +302,32 @@ export function median(values: number[]): number {
   const xs = [...values].sort((a, b) => a - b);
   const mid = xs.length >> 1;
   return xs.length % 2 === 1 ? xs[mid]! : (xs[mid - 1]! + xs[mid]!) / 2;
+}
+
+/** The q-th quantile of a list, nearest-rank. */
+export function quantile(values: number[], q: number): number {
+  const xs = [...values].sort((a, b) => a - b);
+  if (xs.length === 0) return 0;
+  return xs[Math.min(xs.length - 1, Math.floor(q * xs.length))]!;
+}
+
+/** Ordinary least squares for y ~ a + b*x. */
+export function ols(xs: number[], ys: number[]): { a: number; b: number; r2: number } {
+  const n = xs.length;
+  const mx = xs.reduce((s, v) => s + v, 0) / n;
+  const my = ys.reduce((s, v) => s + v, 0) / n;
+  let sxy = 0;
+  let sxx = 0;
+  let syy = 0;
+  for (let i = 0; i < n; i++) {
+    sxy += (xs[i]! - mx) * (ys[i]! - my);
+    sxx += (xs[i]! - mx) ** 2;
+    syy += (ys[i]! - my) ** 2;
+  }
+  const b = sxx > 0 ? sxy / sxx : 0;
+  const a = my - b * mx;
+  const r2 = sxx > 0 && syy > 0 ? (sxy * sxy) / (sxx * syy) : 0;
+  return { a, b, r2 };
 }
 
 // ---------------------------------------------------------------- the farmable filter
@@ -289,64 +379,148 @@ export function isFarmable(p: SnapshotProtocol): boolean {
 
 // ---------------------------------------------------------------- calibration
 
-/**
- * Calibrate the multiple from the snapshot's tokenized peers (market cap > 0 and TVL > 0):
- * the global median multiple, the per-category median shrunk toward it with k pseudo-peers,
- * and the log-log regression's R-squared, which is reported so the dashboard can say honestly
- * that a power law does not fit this data.
- */
-export function calibrate(snapshot: Snapshot, model: ModelConstants): Calibration {
-  const peers = snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
-  const globalMedian = peers.length > 0 ? median(peers.map((p) => p.mcap_usd! / p.tvl_usd)) : 0.2;
+/** The tokenized peers: market cap above zero and TVL above zero. */
+export function tokenizedPeers(snapshot: Snapshot): SnapshotProtocol[] {
+  return snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
+}
+
+/** A fitted size curve plus shrunk category offsets, from a peer set. */
+export function fitCurveOffsets(
+  peers: SnapshotProtocol[],
+  model: ModelConstants,
+): { intercept: number; slope: number; r2: number; offsets: Map<string, { peers: number; offset: number; meanResidual: number }> } {
+  const fit = ols(
+    peers.map((p) => Math.log(p.tvl_usd)),
+    peers.map((p) => Math.log(p.mcap_usd!)),
+  );
   const byCat = new Map<string, number[]>();
   for (const p of peers) {
     const key = p.category ?? 'Uncategorised';
+    const r = Math.log(p.mcap_usd!) - (fit.a + fit.b * Math.log(p.tvl_usd));
     const list = byCat.get(key);
-    if (list) list.push(p.mcap_usd! / p.tvl_usd);
-    else byCat.set(key, [p.mcap_usd! / p.tvl_usd]);
+    if (list) list.push(r);
+    else byCat.set(key, [r]);
   }
-  const shrink = (n: number, med: number | null): number => {
-    const raw = med === null ? globalMedian : (n * med + model.shrink_k * globalMedian) / (n + model.shrink_k);
-    return round4(Math.min(model.multiple_cap, Math.max(model.multiple_floor, raw)));
-  };
-  const perCategory: CalibrationRow[] = [...byCat.entries()]
-    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
-    .map(([category, multiples]) => ({
-      category,
-      peers: multiples.length,
-      median: round4(median(multiples)),
-      multiple: shrink(multiples.length, median(multiples)),
-    }));
-  // Log-log regression log(mcap) ~ log(TVL) over the peers, for the R-squared the dashboard quotes.
-  let r2 = 0;
-  let slope = 0;
-  if (peers.length >= 3) {
-    const xs = peers.map((p) => Math.log(p.tvl_usd));
-    const ys = peers.map((p) => Math.log(p.mcap_usd!));
-    const mx = xs.reduce((a, b) => a + b, 0) / xs.length;
-    const my = ys.reduce((a, b) => a + b, 0) / ys.length;
-    let sxy = 0;
-    let sxx = 0;
-    let syy = 0;
-    for (let i = 0; i < xs.length; i++) {
-      sxy += (xs[i]! - mx) * (ys[i]! - my);
-      sxx += (xs[i]! - mx) ** 2;
-      syy += (ys[i]! - my) ** 2;
-    }
-    slope = sxx > 0 ? sxy / sxx : 0;
-    r2 = sxx > 0 && syy > 0 ? (sxy * sxy) / (sxx * syy) : 0;
+  const offsets = new Map<string, { peers: number; offset: number; meanResidual: number }>();
+  for (const [category, rs] of byCat) {
+    const meanResidual = rs.reduce((s, v) => s + v, 0) / rs.length;
+    const offset = Math.max(-model.offset_cap, Math.min(model.offset_cap, (rs.length * meanResidual) / (rs.length + model.shrink_k)));
+    offsets.set(category, { peers: rs.length, offset, meanResidual });
   }
-  return { global_median: round4(globalMedian), loglog_r2: round4(r2), loglog_slope: round4(slope), peer_count: peers.length, per_category: perCategory };
+  return { intercept: fit.a, slope: fit.b, r2: fit.r2, offsets };
 }
 
-/** The shrunk multiple for one category from a calibration, or the global median when it has no peers. */
-export function multipleFor(category: string | null, calibration: Calibration, model: ModelConstants): { multiple: number; peers: number } {
-  const key = category ?? 'Uncategorised';
-  const row = calibration.per_category.find((r) => r.category === key);
-  if (!row) {
-    return { multiple: round4(Math.min(model.multiple_cap, Math.max(model.multiple_floor, calibration.global_median))), peers: 0 };
+/** The fitted curve's value for one protocol, before the growth, maturity and chain factors. */
+export function curveBase(
+  p: SnapshotProtocol,
+  curve: { intercept: number; slope: number; offsets: Map<string, { offset: number }> },
+): { base: number; offset: number; peers: number } {
+  const entry = curve.offsets.get(p.category ?? 'Uncategorised');
+  const offset = entry ? entry.offset : 0;
+  const peers = entry ? entry.peers : 0;
+  return { base: Math.exp(curve.intercept + curve.slope * Math.log(p.tvl_usd) + offset), offset, peers };
+}
+
+/**
+ * One candidate model scored by leave-one-out validation: each tokenized peer is predicted
+ * from the other peers alone, and the errors are summarised. The candidates are the v1
+ * shrunk median (two priors), the plain size curve, the curve with shrunk offsets (two
+ * priors), and the curve with offsets on winsorized peers. All six are computed the same way,
+ * on the same peers, so the comparison is the evidence — not a claim.
+ */
+export function looTable(peers: SnapshotProtocol[], model: ModelConstants): LooRow[] {
+  const shrunkMedian = (train: SnapshotProtocol[], p: SnapshotProtocol, k: number): number => {
+    const gm = median(train.map((q) => q.mcap_usd! / q.tvl_usd));
+    const cat = train.filter((q) => (q.category ?? 'Uncategorised') === (p.category ?? 'Uncategorised'));
+    const cm = cat.length > 0 ? median(cat.map((q) => q.mcap_usd! / q.tvl_usd)) : gm;
+    const m = Math.min(1.5, Math.max(0.03, (cat.length * cm + k * gm) / (cat.length + k)));
+    return p.tvl_usd * m;
+  };
+  const curveOnly = (train: SnapshotProtocol[], p: SnapshotProtocol): number => {
+    const f = ols(
+      train.map((q) => Math.log(q.tvl_usd)),
+      train.map((q) => Math.log(q.mcap_usd!)),
+    );
+    return Math.exp(f.a + f.b * Math.log(p.tvl_usd));
+  };
+  const curveOffsets = (train: SnapshotProtocol[], p: SnapshotProtocol, k: number): number => {
+    const f = fitCurveOffsets(train, { ...model, shrink_k: k });
+    return Math.exp(f.intercept + f.slope * Math.log(p.tvl_usd) + (f.offsets.get(p.category ?? 'Uncategorised')?.offset ?? 0));
+  };
+  const winsorized = (train: SnapshotProtocol[], p: SnapshotProtocol, k: number): number => {
+    const cap = quantile(train.map((q) => q.mcap_usd! / q.tvl_usd), 0.95);
+    const tr = train.map((q) => ({ ...q, mcap_usd: Math.min(q.mcap_usd!, q.tvl_usd * cap) }));
+    return curveOffsets(tr, p, k);
+  };
+  const candidates: { name: string; predict: (train: SnapshotProtocol[], p: SnapshotProtocol) => number }[] = [
+    { name: 'shrunk median (k=3)', predict: (t, p) => shrunkMedian(t, p, 3) },
+    { name: 'size curve', predict: curveOnly },
+    { name: 'curve + offsets (k=5)', predict: (t, p) => curveOffsets(t, p, 5) },
+    { name: 'curve + offsets (k=10)', predict: (t, p) => curveOffsets(t, p, 10) },
+    { name: 'winsorized curve + offsets (k=5)', predict: (t, p) => winsorized(t, p, 5) },
+    { name: 'shrunk median (k=10)', predict: (t, p) => shrunkMedian(t, p, 10) },
+  ];
+  const chosen = 'curve + offsets (k=10)';
+  return candidates.map(({ name, predict }) => {
+    const errs: number[] = [];
+    for (let i = 0; i < peers.length; i++) {
+      const train = peers.filter((_, j) => j !== i);
+      const pred = predict(train, peers[i]!);
+      errs.push(Math.abs(Math.log(pred) - Math.log(peers[i]!.mcap_usd!)));
+    }
+    const med = median(errs);
+    const mean = errs.reduce((s, v) => s + v, 0) / errs.length;
+    const within2 = errs.filter((e) => e <= Math.log(2)).length / errs.length;
+    const within3 = errs.filter((e) => e <= Math.log(3)).length / errs.length;
+    return {
+      model: name,
+      median_abs_log_err: round3(med),
+      median_factor: round2(Math.exp(med)),
+      mean_abs_log_err: round3(mean),
+      within_2x: round3(within2),
+      within_3x: round3(within3),
+      chosen: name === chosen,
+    };
+  });
+}
+
+/**
+ * Calibrate the model from the snapshot's tokenized peers: the fitted size curve, the shrunk
+ * category offsets, the global median multiple for reference, and the leave-one-out table
+ * that shows why the curve with offsets (k=10) is the shipped model.
+ */
+export function calibrate(snapshot: Snapshot, model: ModelConstants): Calibration {
+  const peers = tokenizedPeers(snapshot);
+  const globalMedian = peers.length > 0 ? median(peers.map((p) => p.mcap_usd! / p.tvl_usd)) : 0.2;
+  const curve = fitCurveOffsets(peers, model);
+  const offsets: OffsetRow[] = [...curve.offsets.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .map(([category, v]) => ({ category, peers: v.peers, mean_residual: round4(v.meanResidual), offset: round4(v.offset) }));
+  const loo = looTable(peers, model);
+  // Chart data for the dashboard's scatter: peers and the fitted line in log10 space.
+  const chartPeers: [number, number][] = peers.map((p) => [round2(Math.log10(p.tvl_usd)), round2(Math.log10(p.mcap_usd!))]);
+  const xs = chartPeers.map(([x]) => x);
+  const lo = Math.min(...xs);
+  const hi = Math.max(...xs);
+  const chartLine: [number, number][] = [];
+  for (let i = 0; i <= 24; i++) {
+    const x = lo + ((hi - lo) * i) / 24;
+    const lnTvl = x * Math.LN10;
+    chartLine.push([round2(x), round2((curve.intercept + curve.slope * lnTvl) / Math.LN10)]);
   }
-  return { multiple: row.multiple, peers: row.peers };
+  return {
+    peer_count: peers.length,
+    global_median: round4(globalMedian),
+    curve_intercept: round4(curve.intercept),
+    curve_slope: round4(curve.slope),
+    loglog_r2: round4(curve.r2),
+    loglog_slope: round4(curve.slope),
+    offsets,
+    loo,
+    chosen_model: 'curve + offsets (k=10)',
+    chart_peers: chartPeers,
+    chart_line: chartLine,
+  };
 }
 
 // ---------------------------------------------------------------- implied value
@@ -355,7 +529,7 @@ export function multipleFor(category: string | null, calibration: Calibration, m
 export function impliedValue(
   p: SnapshotProtocol,
   asOf: string,
-  multiple: number,
+  curveBaseValue: number,
   model: ModelConstants,
 ): { implied: number; growthPct: number; growthMult: number; maturityMult: number; chainMult: number; age: number | null } {
   const age = ageDays(asOf, p.listed_at);
@@ -364,7 +538,7 @@ export function impliedValue(
   const ageForModel = age ?? model.unknown_age_days;
   const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
   const chainMult = 1 + model.chain_step * Math.min(p.chains.length, model.chain_max);
-  const raw = p.tvl_usd * multiple * growthMult * maturityMult * chainMult;
+  const raw = curveBaseValue * growthMult * maturityMult * chainMult;
   const implied = Math.min(model.implied_cap_tvl * p.tvl_usd, Math.max(1, Math.round(raw)));
   return { implied, growthPct, growthMult, maturityMult, chainMult, age };
 }
@@ -488,12 +662,40 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   ];
 }
 
-// ---------------------------------------------------------------- the board
+// ---------------------------------------------------------------- farm economics
 
-/** The snapshot's protocol by slug. */
-function bySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
-  return new Map(protocols.map((p) => [p.slug, p]));
+/** The stated per-action gas cost for one farm action on a chain, in dollars. */
+export function gasPerAction(p: SnapshotProtocol, model: ModelConstants): number {
+  const key = (p.chains.length > 0 ? p.chains[0]! : 'default').toLowerCase();
+  return model.gas_usd[key] ?? model.gas_usd.default ?? 0.5;
 }
+
+/**
+ * One farm netted in dollars: what the position costs against what it could return.
+ * The cost is gas for the plan's actions on the protocol's first chain plus the opportunity
+ * cost of the capital held for the qualifying window at 5% a year. The expected share is the
+ * farmer's slice of the implied value at the stated assumption that 10% of a token's implied
+ * value reaches farmers. The net is share minus cost: a triage heuristic, not a promised
+ * payout. It scales with position size while gas stays flat, so a bigger position or a
+ * cheaper chain is what turns a thin farm into a paying one.
+ */
+export function farmEconomics(
+  p: SnapshotProtocol,
+  age: number | null,
+  implied: number,
+  model: ModelConstants,
+): BoardRow['economics'] {
+  const capital = capitalFor(p);
+  const hold = holdDaysFor(age);
+  const gas = round2(gasPerAction(p, model) * model.gas_actions);
+  const opportunity = round2((capital * hold * model.opportunity_apy) / 365);
+  const cost = round2(gas + opportunity);
+  const expectedShare = round2((capital / p.tvl_usd) * implied * model.farmer_allocation);
+  const net = round2(expectedShare - cost);
+  return { capital_usd: capital, hold_days: hold, gas_usd: gas, opportunity_usd: opportunity, cost_usd: cost, expected_share_usd: expectedShare, net_usd: net };
+}
+
+// ---------------------------------------------------------------- the board
 
 /** The three tokenized peers in the same category with the largest market cap, as comparables. */
 export function topPeers(p: SnapshotProtocol, snapshot: Snapshot): PeerRow[] {
@@ -506,12 +708,18 @@ export function topPeers(p: SnapshotProtocol, snapshot: Snapshot): PeerRow[] {
 
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
 export function buildBoard(snapshot: Snapshot, calibration: Calibration, model: ModelConstants = MODEL): BoardRow[] {
+  const curve = {
+    intercept: calibration.curve_intercept,
+    slope: calibration.curve_slope,
+    offsets: new Map(calibration.offsets.map((o) => [o.category, { offset: o.offset }])),
+  };
   const scored = snapshot.protocols
     .filter(isFarmable)
     .map((p) => {
-      const { multiple, peers } = multipleFor(p.category, calibration, model);
-      const v = impliedValue(p, snapshot.as_of, multiple, model);
-      return { p, multiple, peers, v };
+      const { base, offset, peers } = curveBase(p, curve);
+      const v = impliedValue(p, snapshot.as_of, base, model);
+      const economics = farmEconomics(p, v.age, v.implied, model);
+      return { p, base, offset, peers, v, economics };
     });
   scored.sort((a, b) => b.v.implied - a.v.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   return scored.map((s, i) => ({
@@ -530,7 +738,8 @@ export function buildBoard(snapshot: Snapshot, calibration: Calibration, model: 
     age_days: s.v.age,
     implied_value_usd: s.v.implied,
     model: {
-      multiple: s.multiple,
+      curve_base: s.base,
+      category_offset: round4(s.offset),
       category_peers: s.peers,
       growth_pct: s.v.growthPct,
       growth_multiplier: round4(s.v.growthMult),
@@ -538,6 +747,7 @@ export function buildBoard(snapshot: Snapshot, calibration: Calibration, model: 
       chain_multiplier: round4(s.v.chainMult),
       age_days: s.v.age,
     },
+    economics: s.economics,
     farm_steps: farmSteps(s.p, s.v.age).map(stepText),
   }));
 }
@@ -572,11 +782,14 @@ export function radarRow(row: BoardRow, snapshot: Snapshot): RadarRow {
     change_7d: row.change_7d,
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
-    multiple: row.model.multiple,
+    multiple: round4(row.implied_value_usd / row.tvl_usd),
     category_peers: row.model.category_peers,
+    curve_base: row.model.curve_base,
+    category_offset: row.model.category_offset,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     chain_multiplier: row.model.chain_multiplier,
+    economics: row.economics,
     peers: topPeers(p, snapshot),
     farm_steps: row.farm_steps,
   };

@@ -1,7 +1,7 @@
-// Token Radar v1 — entrypoint (Node 22, standard library only).
+// Token Radar v2 — entrypoint (Node 22, standard library only).
 //
 // Reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), scores every
-// farmable pre-token protocol with the shrunk-median model in lib/model.ts, writes the ranked
+// farmable pre-token protocol with the size-curve model in lib/model.ts, writes the ranked
 // board to /output/board.json, writes the dashboard's data to /output/dashboard/z-data.js,
 // copies this repository's dashboard/ and screenshots/ to /output, and writes
 // /output/dossier.json with the vendored make.fun library.
@@ -94,6 +94,6 @@ writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEX
 
 process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.excluded_size} excluded, ${radar.live_size} live set aside)\n` +
-    `token radar: global median multiple ${radar.calibration.global_median}, log-log R2 ${radar.calibration.loglog_r2} over ${radar.calibration.peer_count} peers\n` +
+    `token radar: curve log(mcap) = ${radar.calibration.curve_intercept} + ${radar.calibration.curve_slope} x log(TVL), R2 ${radar.calibration.loglog_r2}; chosen ${radar.calibration.chosen_model}, LOO median x${radar.calibration.loo.find((l) => l.chosen)?.median_factor} over ${radar.calibration.peer_count} peers\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'dashboard')} (${dash.length + 1} files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );

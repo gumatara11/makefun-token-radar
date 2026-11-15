@@ -3,7 +3,9 @@
 // per protocol. No network: every byte it shows is in z-data.js.
 // The page recomputes each row's implied value and each protocol's farm plan from the same
 // inputs main.ts used, so a mismatch between the page and board.json would show in the detail
-// view instead of hiding behind a static dump.
+// view instead of hiding behind a static dump. The model is a fitted size curve plus a
+// shrunk category offset (see the model panel); the page stores the curve base per row and
+// re-applies the growth, maturity and chain factors.
 (function () {
   'use strict';
 
@@ -29,16 +31,21 @@
     return Math.max(0, Math.round(days)) + 'd';
   }
   function fmtMult(n) { return (Math.round(n * 10000) / 10000).toFixed(4).replace(/0+$/, '').replace(/\.$/, '.0'); }
+  function fmtNet(n) {
+    if (n === null || n === undefined || !isFinite(n)) return 'n/a';
+    return (n >= 0 ? '+$' : '-$') + Math.abs(n).toFixed(2);
+  }
 
-  // The model, recomputed in the page from the snapshot figures: TVL x category multiple
-  // (shrunk median, see model panel) x growth x maturity x chain breadth, capped at 5x TVL.
-  function impliedOf(row, model, multiple) {
+  // The model, recomputed in the page from the snapshot figures: the fitted curve's base value
+  // for this TVL (stored per row, curve + category offset) x growth x maturity x chain breadth,
+  // capped at 5x TVL.
+  function impliedOf(row, model, curveBase) {
     var growth = Math.min(model.growth_cap, Math.max(model.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
     var growthMult = 1 + (growth / 100) * model.growth_weight;
     var age = row.age_days === null || row.age_days === undefined ? model.unknown_age_days : row.age_days;
     var maturity = model.maturity_floor + (Math.min(Math.max(age, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
     var chainMult = 1 + model.chain_step * Math.min((row.chains || []).length, model.chain_max);
-    return Math.min(model.implied_cap_tvl * row.tvl_usd, Math.max(1, Math.round(row.tvl_usd * multiple * growthMult * maturity * chainMult)));
+    return Math.min(model.implied_cap_tvl * row.tvl_usd, Math.max(1, Math.round(curveBase * growthMult * maturity * chainMult)));
   }
 
   function el(tag, attrs) {
@@ -174,6 +181,7 @@
       else if (key === 'growth') { av = a.change_7d === null ? -Infinity : a.change_7d; bv = b.change_7d === null ? -Infinity : b.change_7d; }
       else if (key === 'age') { av = a.age_days === null ? Infinity : a.age_days; bv = b.age_days === null ? Infinity : b.age_days; }
       else if (key === 'multiple') { av = a.multiple; bv = b.multiple; }
+      else if (key === 'net') { av = a.economics.net_usd; bv = b.economics.net_usd; }
       else { av = a.implied_value_usd; bv = b.implied_value_usd; }
       if (av < bv) return -state.dir;
       if (av > bv) return state.dir;
@@ -202,7 +210,7 @@
         el('div', { class: 'fact' }, el('span', { text: 'Watchlist covered' }), el('b', { text: DATA.watchlist_size + ' / ' + DATA.watchlist_size })),
         el('div', { class: 'fact' }, el('span', { text: 'Farmable rows' }), el('b', { text: String(DATA.board_size) })),
         el('div', { class: 'fact' }, el('span', { text: 'Total implied value' }), el('b', { text: fmtUsd(DATA.total_implied_usd) })),
-        el('div', { class: 'fact' }, el('span', { text: 'Global median multiple' }), el('b', { text: String(DATA.calibration.global_median) })),
+        el('div', { class: 'fact' }, el('span', { text: 'Out-of-sample error' }), el('b', { text: 'x' + DATA.calibration.loo.filter(function (l) { return l.chosen; })[0].median_factor + ' median' })),
         el('div', { class: 'fact' }, el('span', { text: 'Calibration peers' }), el('b', { text: String(DATA.calibration.peer_count) }))
       )
     );
@@ -285,6 +293,7 @@
           el('span', { class: 'num', text: fmtUsd(r.implied_value_usd) })
         )),
         el('td', { class: 'num', text: fmtMult(r.multiple) }),
+        el('td', { class: 'num ' + (r.economics.net_usd >= 0 ? 'pos' : 'neg'), text: fmtNet(r.economics.net_usd) }),
         el('td', null, el('span', { class: 'status', text: 'no token' }))
       );
       tbody.appendChild(tr);
@@ -301,6 +310,7 @@
             sortHeader('age', 'Age'),
             sortHeader('implied', 'Implied value'),
             sortHeader('multiple', 'Multiple'),
+            sortHeader('net', 'Net'),
             el('th', { scope: 'col', text: 'Token' })
           )),
           tbody
@@ -356,33 +366,84 @@
   function modelPanel() {
     var m = DATA.model;
     var cal = DATA.calibration;
-    var calibRows = cal.per_category.map(function (c) {
+    var chosen = cal.loo.filter(function (l) { return l.chosen; })[0];
+    var looRows = cal.loo.map(function (l) {
       return el('tr', null,
-        el('td', { text: c.category }),
-        el('td', { class: 'num', text: String(c.peers) }),
-        el('td', { class: 'num', text: c.median === null ? 'n/a' : fmtMult(c.median) }),
-        el('td', { class: 'num', text: fmtMult(c.multiple) })
+        el('td', { text: l.model + (l.chosen ? '  (shipped)' : '') }),
+        el('td', { class: 'num', text: 'x' + l.median_factor.toFixed(2) }),
+        el('td', { class: 'num', text: l.mean_abs_log_err.toFixed(3) }),
+        el('td', { class: 'num', text: (l.within_2x * 100).toFixed(1) + '%' }),
+        el('td', { class: 'num', text: (l.within_3x * 100).toFixed(1) + '%' })
       );
     });
+    var offsetRows = cal.offsets.map(function (o) {
+      return el('tr', null,
+        el('td', { text: o.category }),
+        el('td', { class: 'num', text: String(o.peers) }),
+        el('td', { class: 'num', text: (o.mean_residual >= 0 ? '+' : '') + o.mean_residual.toFixed(4) }),
+        el('td', { class: 'num', text: (o.offset >= 0 ? '+' : '') + o.offset.toFixed(4) })
+      );
+    });
+    // Scatter: tokenized peers in log10 space with the fitted size curve, as an inline SVG.
+    var peers = cal.chart_peers;
+    var line = cal.chart_line;
+    var xs = peers.map(function (p) { return p[0]; });
+    var ys = peers.map(function (p) { return p[1]; });
+    var x0 = Math.floor(Math.min.apply(null, xs)), x1 = Math.ceil(Math.max.apply(null, xs));
+    var y0 = Math.floor(Math.min.apply(null, ys)), y1 = Math.ceil(Math.max.apply(null, ys));
+    var W = 560, H = 300, L = 46, R = 12, T = 12, B = 30;
+    var sx = function (x) { return L + ((x - x0) / (x1 - x0)) * (W - L - R); };
+    var sy = function (y) { return T + (1 - (y - y0) / (y1 - y0)) * (H - T - B); };
+    var svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="Scatter of tokenized peers: log10 market cap against log10 TVL, with the fitted size curve">';
+    var t;
+    for (t = x0; t <= x1; t++) {
+      svg += '<line x1="' + sx(t).toFixed(1) + '" y1="' + sy(y0).toFixed(1) + '" x2="' + sx(t).toFixed(1) + '" y2="' + sy(y1).toFixed(1) + '" stroke="#2a2f3a" stroke-width="1"/>';
+      svg += '<text x="' + sx(t).toFixed(1) + '" y="' + (H - 10) + '" fill="#8a93a3" font-size="11" text-anchor="middle">10^' + t + '</text>';
+    }
+    for (t = y0; t <= y1; t++) {
+      svg += '<line x1="' + L + '" y1="' + sy(t).toFixed(1) + '" x2="' + (W - R) + '" y2="' + sy(t).toFixed(1) + '" stroke="#2a2f3a" stroke-width="1"/>';
+      svg += '<text x="' + (L - 6) + '" y="' + (sy(t) + 4).toFixed(1) + '" fill="#8a93a3" font-size="11" text-anchor="end">10^' + t + '</text>';
+    }
+    svg += '<text x="' + ((L + W - R) / 2).toFixed(1) + '" y="' + (H - 10 + 0) + '" fill="#8a93a3" font-size="11" text-anchor="middle"></text>';
+    svg += '<text x="14" y="' + ((T + H - B) / 2).toFixed(1) + '" fill="#8a93a3" font-size="11" text-anchor="middle" transform="rotate(-90 14 ' + ((T + H - B) / 2).toFixed(1) + ')">market cap (log)</text>';
+    svg += '<text x="' + ((L + W - R) / 2).toFixed(1) + '" y="' + (H - 26 + 36) + '" fill="#8a93a3" font-size="11" text-anchor="middle"></text>';
+    svg += '<polyline points="' + line.map(function (p) { return sx(p[0]).toFixed(1) + ',' + sy(p[1]).toFixed(1); }).join(' ') + '" fill="none" stroke="#f5c86b" stroke-width="2"/>';
+    peers.forEach(function (p) {
+      svg += '<circle cx="' + sx(p[0]).toFixed(1) + '" cy="' + sy(p[1]).toFixed(1) + '" r="2.6" fill="#7fb3ff" opacity="0.85"/>';
+    });
+    svg += '</svg>';
     return el('section', { class: 'panel model' },
       el('h2', { text: 'How implied value is computed' }),
       el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked.' }),
       el('div', { class: 'formula' },
-        'multiple(cat) = (n x median(cat) + 3 x ' + cal.global_median + ') / (n + 3), clamped to [0.03, 1.5]\n' +
-        'implied = min(5 x TVL, round(TVL x multiple x (1 + clamp(change_7d, -40, +60) / 100 x 0.6)\n' +
+        'log(mcap) = ' + cal.curve_intercept + ' + ' + cal.curve_slope + ' x log(TVL) + offset(category)\n' +
+        'offset(category) = clamp(n x mean_residual(category) / (n + ' + m.shrink_k + '), -1, +1)\n' +
+        'implied = min(5 x TVL, round(exp(curve) x (1 + clamp(change_7d, -40, +60) / 100 x 0.6)\n' +
         '  x (0.7 + 0.3 x min(age_days, 1095) / 1095) x (1 + 0.02 x min(chains, 15))))'
       ),
-      el('p', { class: 'sub', text: 'The multiple is calibrated from ' + cal.peer_count + ' tokenized peers with a market cap above zero: the median market-cap/TVL multiple of the peers in the protocol\u2019s own category, shrunk toward the global median of ' + cal.global_median + ' with 3 pseudo-peers, so a category with one peer cannot set a wild multiple. A category with no peers uses the global median.' }),
-      el('p', { class: 'sub', text: 'Why a shrunk median and not a power law: the log-log regression log(market cap) on log(TVL) over the same peers has R-squared ' + cal.loglog_r2 + ' (slope ' + cal.loglog_slope + '), too weak to support a fitted curve, and the per-category slope is unstable. A median of real comparables says what the market actually paid; a power law would pretend the data says more than it does.' }),
+      el('p', { class: 'sub', text: 'The curve is fitted to ' + cal.peer_count + ' tokenized peers with a market cap above zero (log-log R-squared ' + cal.loglog_r2 + '): the market pays more for bigger protocols, but sub-linearly, so a curve fits better than one flat multiple. The category offset is the category\u2019s mean residual from that curve, shrunk toward zero with ' + m.shrink_k + ' pseudo-peers and clamped to plus or minus 1 in log space, so a category with one peer cannot set the whole board. A category with no peers uses an offset of zero.' }),
+      el('p', { class: 'sub', text: 'Why this model and not the shrunk median: each candidate was tested by leaving one peer out at a time and predicting it from the other ' + (cal.peer_count - 1) + ' peers. The median the earlier version used misses a held-out peer by a factor of x5.16 (only 20.3% within 2x); the plain curve misses by x3.40, and the curve with offsets (k=10) — the shipped model — misses by x' + chosen.median_factor.toFixed(2) + ' at the median and has the smallest mean error and the most peers within 3x. The plain curve has the best median error, so the offset model was chosen for its mean and its 3x coverage, not for a single best number.' }),
       el('div', { class: 'calib' },
         el('div', { class: 'table-wrap' },
           el('table', null,
-            el('caption', { class: 'sub', text: 'Calibration by category: peers, their median multiple, and the shrunk multiple the model uses.' }),
-            el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Category' }), el('th', { scope: 'col', text: 'Peers' }), el('th', { scope: 'col', text: 'Median' }), el('th', { scope: 'col', text: 'Multiple used' }))),
-            el('tbody', null, calibRows)
+            el('caption', { class: 'sub', text: 'Leave-one-out validation on the ' + cal.peer_count + ' tokenized peers: each model predicts each peer from the other peers alone.' }),
+            el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Candidate model' }), el('th', { scope: 'col', text: 'Median error' }), el('th', { scope: 'col', text: 'Mean log error' }), el('th', { scope: 'col', text: 'Within 2x' }), el('th', { scope: 'col', text: 'Within 3x' }))),
+            el('tbody', null, looRows)
           )
         )
       ),
+      el('div', { class: 'chart' }, el('div', { html: svg })),
+      el('p', { class: 'sub', text: 'Tokenized peers against the fitted size curve, in log10 space. Each dot is a protocol whose token already trades; the line is the curve the model starts from before the category offset and the growth, maturity and chain factors.' }),
+      el('div', { class: 'calib' },
+        el('div', { class: 'table-wrap' },
+          el('table', null,
+            el('caption', { class: 'sub', text: 'Category offsets: peers, their mean residual from the curve, and the shrunk offset the model uses.' }),
+            el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Category' }), el('th', { scope: 'col', text: 'Peers' }), el('th', { scope: 'col', text: 'Mean residual' }), el('th', { scope: 'col', text: 'Offset used' }))),
+            el('tbody', null, offsetRows)
+          )
+        )
+      ),
+      el('p', { class: 'sub', text: 'Farm economics, per row: the farm costs gas for 8 actions on the protocol\u2019s first chain (Ethereum $6, BSC $0.50, Arbitrum, Base, Optimism, Gnosis, Linea, zkSync and Scroll $0.10, Polygon $0.05, Solana $0.02, Avalanche $0.30, anything else $0.50) plus the opportunity cost of the capital held for the qualifying window at 5% a year. The expected share is the farmer\u2019s slice of the implied value at the stated assumption that 10% of a token\u2019s implied value reaches farmers. The net is share minus cost: a triage heuristic, not a promised payout. It scales with position size while gas stays flat, so a bigger position or a cheaper chain is what turns a thin farm into a paying one.' }),
       el('p', { class: 'note', text: 'Implied value is this model\u2019s claim about what a token would be worth if the protocol\u2019s record stayed as it is — not a promise that a token will launch, and not a price. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unknown age uses 365 days.' })
     );
   }
@@ -397,7 +458,7 @@
     writeHash();
     dialog.textContent = '';
     var steps = farmSteps(row);
-    var recomputed = impliedOf(row, DATA.model, row.multiple);
+    var recomputed = impliedOf(row, DATA.model, row.curve_base);
     var check = recomputed === row.implied_value_usd
       ? 'The page recomputes this row as ' + fmtUsd(recomputed) + ', the same number board.json carries.'
       : 'The page recomputes this row as ' + fmtUsd(recomputed) + ', which differs from the board: the data would be stale.';
@@ -418,7 +479,8 @@
       el('h3', { text: 'Valuation waterfall' }),
       el('div', { class: 'equation' },
         el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
-        el('div', null, el('span', { text: 'Category multiple (' + row.category_peers + ' peers)' }), el('b', { class: 'num', text: 'x ' + fmtMult(row.multiple) })),
+        el('div', null, el('span', { text: 'Curve value at this TVL' }), el('b', { class: 'num', text: fmtUsd(row.curve_base) })),
+        el('div', null, el('span', { text: 'Category offset (' + row.category_peers + ' peers)' }), el('b', { class: 'num', text: (row.category_offset >= 0 ? '+' : '') + row.category_offset.toFixed(4) + ' in log space' })),
         el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
         el('div', null, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: 'x ' + fmtMult(growthMult) })),
         el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
@@ -446,15 +508,28 @@
             el('tbody', null, peerRows)
           )
         ),
-        el('p', { class: 'sub', text: 'These tokens already trade, so their multiples are facts. The model uses the median of all ' + row.category_peers + ' peers in this category, shrunk toward the global median — not just these three.' })
+        el('p', { class: 'sub', text: 'These tokens already trade, so their multiples are facts. The model does not use their median directly: it starts on the fitted size curve and adds this category\u2019s shrunk offset, built from all ' + row.category_peers + ' peers in the category — not just these three.' })
       );
     } else {
       peerSection = el('section', { class: 'detail-section' },
         el('h3', { text: 'Closest tokenized comparables' }),
-        el('p', { class: 'sub', text: 'No tokenized peer in this category, so the model uses the global median multiple of ' + DATA.calibration.global_median + '.' })
+        el('p', { class: 'sub', text: 'No tokenized peer in this category, so the model uses an offset of zero: the curve value alone.' })
       );
     }
     dialog.appendChild(peerSection);
+    var econ = row.economics;
+    dialog.appendChild(el('section', { class: 'detail-section' },
+      el('h3', { text: 'Farm economics' }),
+      el('div', { class: 'equation' },
+        el('div', null, el('span', { text: 'Capital in the position' }), el('b', { class: 'num', text: '$' + econ.capital_usd })),
+        el('div', null, el('span', { text: 'Gas, 8 actions on ' + (row.chains && row.chains.length ? row.chains[0] : 'its main chain') }), el('b', { class: 'num', text: '$' + econ.gas_usd.toFixed(2) })),
+        el('div', null, el('span', { text: 'Opportunity cost, ' + econ.hold_days + ' days at 5% a year' }), el('b', { class: 'num', text: '$' + econ.opportunity_usd.toFixed(2) })),
+        el('div', null, el('span', { text: 'Total farm cost' }), el('b', { class: 'num', text: '$' + econ.cost_usd.toFixed(2) })),
+        el('div', null, el('span', { text: 'Expected share (10% of implied value to farmers)' }), el('b', { class: 'num', text: '$' + econ.expected_share_usd.toFixed(2) })),
+        el('div', { class: 'total' }, el('span', { text: 'Net' }), el('b', { class: 'num ' + (econ.net_usd >= 0 ? 'pos' : 'neg'), text: fmtNet(econ.net_usd) }))
+      ),
+      el('p', { class: 'sub', text: 'The net is a triage heuristic, not a promised payout: it assumes 10% of the implied value reaches farmers and scales with position size while gas stays flat. A bigger position or a cheaper chain is what turns a thin farm into a paying one.' })
+    ));
     dialog.appendChild(el('section', { class: 'detail-section' },
       el('h3', { text: 'Farm plan' }),
       el('ol', { class: 'steps' }, steps.map(function (s) {

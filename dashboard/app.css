@@ -83,6 +83,8 @@ tbody tr:hover, tbody tr[data-selected="true"] { background: var(--panel2); }
 }
 .calib { margin-top: 12px; }
 .calib table { font-size: 13px; }
+.chart { margin-top: 12px; background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px 4px; }
+.chart svg { width: 100%; height: auto; display: block; }
 .note { border-left: 3px solid var(--amber); padding: 2px 0 2px 12px; color: var(--muted); margin: 10px 0 0; }
 dialog.detail {
   background: var(--panel); color: var(--ink); border: 1px solid var(--line);
